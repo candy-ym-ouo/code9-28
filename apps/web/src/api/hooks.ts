@@ -74,6 +74,20 @@ export const useAlbum = (id: string | undefined) =>
     enabled: Boolean(id),
   });
 
+export interface AlbumSnapshotMeta {
+  id: string;
+  version: number;
+  payload_hash: string;
+  created_at: string;
+}
+
+export const useAlbumSnapshots = (id: string | undefined) =>
+  useQuery({
+    queryKey: ['album-snapshots', id],
+    queryFn: () => get<{ items: AlbumSnapshotMeta[] }>(`/albums/${id}/snapshots`),
+    enabled: Boolean(id),
+  });
+
 export const useSearch = (params: Record<string, string | number | undefined>, enabled = true) => {
   const qs = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== '') qs.set(k, String(v));

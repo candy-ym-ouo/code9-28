@@ -379,6 +379,184 @@ describe('E7 隐私：模糊化、强制降级与撤销', () => {
   });
 });
 
+describe('E7.5 画册版本冻结：发布后增删条目不改变既有分享内容', () => {
+  let freezeAlbum = '';
+  let secondCard = '';
+  let v1Token = '';
+  let v1Titles: string[] = [];
+
+  it('准备：第二张卡 + 只含一张卡的画册并发布 v1 分享', async () => {
+    secondCard = (await call('post', '/api/inspirations', { title: '霓虹雨夜' })).body.id;
+    await call('post', '/api/inspirations/bulk-tag', {
+      ids: [secondCard],
+      addTagIds: [tagIds['霓虹招牌']],
+    });
+    await call('post', `/api/inspirations/${secondCard}/spot`, { spotId });
+    await call('put', `/api/inspirations/${secondCard}/timing`, {
+      timeAnchor: 'blue_pm',
+      anchorOffsetMin: 0,
+      elevationRange: [-90, 90],
+      azimuthRange: null,
+      azimuthTolerance: 15,
+      windowToleranceMin: 12,
+      weatherProfile: {},
+      seasonWindow: null,
+      notes: null,
+    });
+
+    freezeAlbum = (
+      await call('post', '/api/albums', {
+        title: '冻结测试册',
+        rules: {
+          requireTags: [{ tagIds: [tagIds['逆光']], min: 1, required: true }],
+          requireAnchors: [],
+          requireWeather: [],
+          totalMin: 1,
+          autoMatch: { enabled: false, minTagHits: 1 },
+        },
+      })
+    ).body.id;
+    await call('post', `/api/albums/${freezeAlbum}/items`, { inspirationId: cardId });
+    const pub = await call('post', `/api/albums/${freezeAlbum}/publish`, {
+      createShare: true,
+      fuzzLevel: 'g1k',
+      expiresInDays: 2,
+    });
+    expect(pub.status).toBe(201);
+    expect(pub.body.version).toBe(1);
+    v1Token = pub.body.shareToken;
+
+    const saved = token;
+    token = '';
+    const view = await call('get', `/api/share/${v1Token}`);
+    token = saved;
+    expect(view.status).toBe(200);
+    expect(view.body.version).toBe(1);
+    expect(view.body.frozen).toBe(true);
+    v1Titles = view.body.items.map((i: { title: string }) => i.title);
+    expect(v1Titles).toContain('连廊黄昏');
+    expect(v1Titles).not.toContain('霓虹雨夜');
+  });
+
+  it('发布后加卡：工作副本变化，但旧链接与 v1 快照都不变', async () => {
+    await call('post', `/api/albums/${freezeAlbum}/items`, { inspirationId: secondCard });
+    const detail = await call('get', `/api/albums/${freezeAlbum}`);
+    expect(detail.body.items.map((i: { id: string }) => i.id)).toContain(secondCard);
+
+    const saved = token;
+    token = '';
+    const view = await call('get', `/api/share/${v1Token}`);
+    token = saved;
+    expect(view.body.version).toBe(1);
+    const titles = view.body.items.map((i: { title: string }) => i.title);
+    expect(titles).toEqual(v1Titles);
+    expect(titles).not.toContain('霓虹雨夜');
+
+    const snap = await call('get', `/api/albums/${freezeAlbum}/snapshots`);
+    expect(snap.body.latest.version).toBe(1);
+    expect(
+      (snap.body.latest.payload.items as { title: string }[]).map((i) => i.title),
+    ).toEqual(v1Titles);
+  });
+
+  it('发布后删卡：旧链接仍能读到 v1 里的那张卡', async () => {
+    await call('delete', `/api/albums/${freezeAlbum}/items/${cardId}`);
+
+    const saved = token;
+    token = '';
+    const view = await call('get', `/api/share/${v1Token}`);
+    token = saved;
+    expect(view.body.version).toBe(1);
+    expect(view.body.items.map((i: { title: string }) => i.title)).toEqual(v1Titles);
+    expect(view.body.items.map((i: { title: string }) => i.title)).toContain('连廊黄昏');
+  });
+
+  it('已发布卡本身被改名/打标：旧链接仍显示发布时的标题', async () => {
+    // 重新加回卡再改标题（删除本身也不影响快照，这里额外验证内容字段冻结）
+    await call('post', `/api/albums/${freezeAlbum}/items`, { inspirationId: cardId });
+    await call('patch', `/api/inspirations/${cardId}`, { title: '连廊黄昏（已改名）' });
+
+    const saved = token;
+    token = '';
+    const view = await call('get', `/api/share/${v1Token}`);
+    token = saved;
+    const v1Card = view.body.items.find((i: { id: string }) => i.id === cardId);
+    expect(v1Card.title).toBe('连廊黄昏');
+  });
+
+  it('图片越权检查同样以快照为准：工作副本的改动不放大/缩小旧链接权限', async () => {
+    // 旧快照只含 cardId：secondCard 的图即使此刻在工作副本里，也不能通过 v1 链接访问
+    const secondAssets = (await call('get', `/api/inspirations/${secondCard}`)).body.item.assets as
+      | { id: string }[]
+      | undefined;
+    const cardAssets = (await call('get', `/api/inspirations/${cardId}`)).body.item.assets as
+      | { id: string }[]
+      | undefined;
+
+    const saved = token;
+    token = '';
+    if (secondAssets && secondAssets.length > 0) {
+      const denied = await call('get', `/api/share/${v1Token}/assets/${secondAssets[0].id}`);
+      expect([403, 404]).toContain(denied.status);
+    }
+    if (cardAssets && cardAssets.length > 0) {
+      // cardId 在 v1 快照内，其图必须仍可取（删除工作副本关联也不影响）
+      const allowed = await call('get', `/api/share/${v1Token}/assets/${cardAssets[0].id}`);
+      expect(allowed.status).toBe(200);
+    }
+    token = saved;
+  });
+
+  it('再次发布生成 v2：旧链接仍冻结 v1，新链接才展示 v2', async () => {
+    // 当前工作副本同时含两张卡，必需缺口仍闭合，可发新版本
+    const pub2 = await call('post', `/api/albums/${freezeAlbum}/publish`, { createShare: false });
+    expect(pub2.status).toBe(201);
+    expect(pub2.body.version).toBe(2);
+
+    const v2Link = await call('post', '/api/share-links', {
+      scope: 'album',
+      scopeId: freezeAlbum,
+      fuzzLevel: 'g500',
+      expiresInDays: 1,
+    });
+    expect(v2Link.status).toBe(201);
+    expect(v2Link.body.snapshotVersion).toBe(2);
+    const v2Token = v2Link.body.token;
+
+    const saved = token;
+    token = '';
+    const oldView = await call('get', `/api/share/${v1Token}`);
+    const newView = await call('get', `/api/share/${v2Token}`);
+    token = saved;
+    expect(oldView.body.version).toBe(1);
+    expect(oldView.body.items.map((i: { title: string }) => i.title)).toEqual(v1Titles);
+    expect(newView.body.version).toBe(2);
+    const v2Titles = newView.body.items.map((i: { title: string }) => i.title);
+    // v2 反映发布时刻的工作副本：改名后的标题 + 新加入的卡
+    expect(v2Titles).toContain('连廊黄昏（已改名）');
+    expect(v2Titles.some((t: string) => t.includes('霓虹雨夜'))).toBe(true);
+
+    // 清理：撤销新建的 v2 链接，避免影响 E7 之后按 scope 找链接的其它用例
+    await call('post', `/api/share-links/${v2Link.body.id}/revoke`, {});
+  });
+
+  it('未发布画册不能创建分享链接', async () => {
+    const unpublished = (
+      await call('post', '/api/albums', {
+        title: '没发过的册',
+        rules: { requireTags: [], requireAnchors: [], requireWeather: [], totalMin: 0, autoMatch: { enabled: false, minTagHits: 1 } },
+      })
+    ).body.id;
+    const res = await call('post', '/api/share-links', {
+      scope: 'album',
+      scopeId: unpublished,
+      fuzzLevel: 'g500',
+      expiresInDays: 1,
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
 describe('E8 检索与零结果兜底', () => {
   it('按标签检索命中', async () => {
     const res = await call('get', `/api/search?tagIds=${tagIds['逆光']}`);

@@ -19,7 +19,7 @@ import {
   message,
 } from 'antd';
 import type { AlbumGapDto } from '@flil/shared';
-import { useAlbum, useAlbumActions } from '../api/hooks.js';
+import { useAlbum, useAlbumActions, useAlbumSnapshots } from '../api/hooks.js';
 import { authedImageUrl } from '../api/client.js';
 import { useSession } from '../stores/session.js';
 
@@ -36,6 +36,7 @@ export default function AlbumDetail() {
   const [published, setPublished] = useState<{ version: number; token: string | null } | null>(null);
 
   const item = album.data?.item;
+  const snapshots = useAlbumSnapshots(id);
 
   async function doPublish() {
     if (!id) return;
@@ -49,7 +50,7 @@ export default function AlbumDetail() {
       });
       setPublished({ version: res.version, token: res.shareToken });
       setPublishing(false);
-      message.success(`已发布 v${res.version}（快照不可变）`);
+      message.success(`已发布 v${res.version}（旧链接继续冻结在各自版本）`);
     } catch (err) {
       message.error((err as Error).message);
     }
@@ -89,7 +90,7 @@ export default function AlbumDetail() {
               disabled={requiredOpen.length > 0}
               onClick={() => setPublishing(true)}
             >
-              发布
+              {item.status === 'published' ? '发布新版本' : '发布'}
             </Button>
           </Space>
         }
@@ -190,6 +191,23 @@ export default function AlbumDetail() {
         />
       </Card>
 
+      {(snapshots.data?.items.length ?? 0) > 0 ? (
+        <Card title="已发布版本（历史版本对外冻结）" size="small">
+          <Space direction="vertical" style={{ width: '100%' }}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              每次发布生成一个不可变版本，分享链接永久停在创建时的版本。发布之后再增删条目或修改卡片，旧链接内容不变；需要让改动对外可见时，再次发布生成新版本并创建新链接。
+            </Typography.Text>
+            <Space wrap>
+              {(snapshots.data?.items ?? []).map((s) => (
+                <Tag key={s.id} color={s.version === snapshots.data?.items[0]?.version ? 'blue' : 'default'}>
+                  v{s.version} · {s.created_at.slice(0, 10)}
+                </Tag>
+              ))}
+            </Space>
+          </Space>
+        </Card>
+      ) : null}
+
       <Card title={`已入册 ${album.data?.items.length ?? 0} 张`}>
         {(album.data?.items ?? []).length === 0 ? (
           <Empty description="还没有入册的卡片" />
@@ -236,7 +254,7 @@ export default function AlbumDetail() {
           <Alert
             type="info"
             showIcon
-            message="发布 = 生成一份不可变快照，之后原卡片再改也不会篡改已发布版本。"
+            message="发布 = 生成一份不可变快照，分享链接冻结在这个版本上。之后增删条目、改卡片都不会动旧链接；再次发布会生成新版本。"
           />
           <Space>
             <Typography.Text type="secondary">同时创建分享链接</Typography.Text>

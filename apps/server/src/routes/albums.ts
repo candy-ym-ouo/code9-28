@@ -197,7 +197,7 @@ albumRouter.post(
       })
       .parse(req.body ?? {});
 
-    let share: { token: string } | null = null;
+    let share: { token: string; fuzzLevel: FuzzLevel } | null = null;
     if (input.createShare) {
       const link = createShareLink({
         libraryId: ctx.libraryId,
@@ -208,10 +208,19 @@ albumRouter.post(
         password: input.password ?? null,
         userId: req.auth!.id,
       });
-      share = { token: link.token };
+      share = { token: link.token, fuzzLevel: link.fuzz_level };
     }
 
-    const result = publishAlbum(req.params.id, ctx.libraryId, ctx, share);
+    let result;
+    try {
+      result = publishAlbum(req.params.id, ctx.libraryId, ctx, share);
+    } catch (err) {
+      // 发布被拒（如必需缺口未闭合）时，回收刚才预建的分享链接，避免留下无版本的孤儿链接
+      if (share) {
+        getDb().prepare('DELETE FROM share_link WHERE token = ?').run(share.token);
+      }
+      throw err;
+    }
     const album = requireAlbum(req.params.id, ctx.libraryId);
     ok(res, { ...result, item: toAlbumDto(album) }, 201);
   }),

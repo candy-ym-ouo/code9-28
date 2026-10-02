@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
-import type { AlbumGapDto, InspirationDto, TimeAnchor, WeatherPhenomenon } from '@flil/shared';
+import type { AlbumGapDto, FuzzLevel, InspirationDto, TimeAnchor, WeatherPhenomenon } from '@flil/shared';
 import { getDb, newId, nowIso, parseJson, toJson } from '../db.js';
 import { errors } from '../http/errors.js';
 import { toAlbumDto, toGapDto, toInspirationDto, type SerializeContext } from './serialization.js';
 import { loadTiming } from './windowEngine.js';
-import { fuzzSpotCached, type PlaceRow, type SpotRow } from './fuzzing.js';
+import { assertShareFuzzLevel, fuzzSpotCached, type PlaceRow, type SpotRow } from './fuzzing.js';
+import { pinShareLinkVersion } from './share.js';
 import type { AssetRow } from './assets.js';
 
 export const ALBUM_RULE_DEFAULTS = {
@@ -418,17 +419,27 @@ export interface PublishResult {
 /**
  * 发布：生成不可变快照（文档 14.5）。
  * 快照内一律是模糊坐标，原图路径永不进入快照。
+ *
+ * 冻结原则：随发布创建的分享链接会在同一事务里绑定到本次版本号，
+ * 此后画册的增删改只影响工作副本，旧链接永远读到本版本；
+ * 要让改动对外可见，只能再次发布生成新版本。
  */
 export function publishAlbum(
   albumId: string,
   libraryId: string,
   ctx: SerializeContext,
-  share: { token: string } | null,
+  share: { token: string; fuzzLevel: FuzzLevel } | null,
 ): PublishResult {
   const db = getDb();
   const album = requireAlbum(albumId, libraryId);
   const openRequired = listGaps(albumId).filter((g) => g.isRequired && g.status === 'open');
   if (openRequired.length > 0) throw errors.albumHasRequiredGaps(openRequired.length);
+
+  // 快照里的坐标必须按"对外分享级别"冻结：随发布建链时用链接级别，
+  // 纯发布（无链接）时用库默认级别。两种情况都强制不细于 g500（安全底线）。
+  const snapshotFuzzLevel: FuzzLevel = share
+    ? assertShareFuzzLevel(share.fuzzLevel)
+    : assertShareFuzzLevel(ctx.defaultFuzzLevel);
 
   const items = db
     .prepare('SELECT * FROM album_item WHERE album_id = ? ORDER BY sort_order, created_at')
@@ -455,7 +466,7 @@ export function publishAlbum(
       const placeRow = spotRow
         ? ((db.prepare('SELECT * FROM place WHERE id = ?').get(spotRow.place_id) as PlaceRow | undefined) ?? null)
         : null;
-      if (spotRow) fuzz = fuzzSpotCached(spotRow, placeRow, ctx.defaultFuzzLevel);
+      if (spotRow) fuzz = fuzzSpotCached(spotRow, placeRow, snapshotFuzzLevel);
     }
     const timingRow = loadTiming(item.inspiration_id);
 
@@ -479,7 +490,7 @@ export function publishAlbum(
     conditionSummary: summarizeConditions(payloadItems),
     items: payloadItems,
     publishedAt: nowIso(),
-    fuzzLevel: ctx.defaultFuzzLevel,
+    fuzzLevel: snapshotFuzzLevel,
     shareToken: share?.token ?? null,
   };
 
@@ -494,15 +505,25 @@ export function publishAlbum(
   const hash = createHash('sha256').update(payloadJson).digest('hex');
   const snapshotId = newId();
   const ts = nowIso();
+  const shareLinkId = share
+    ? (db.prepare('SELECT id FROM share_link WHERE token = ?').get(share.token) as { id: string } | undefined)?.id ??
+      null
+    : null;
 
-  db.prepare(
-    'INSERT INTO album_snapshot (id, album_id, version, payload, payload_hash, share_link_id, created_at) VALUES (?,?,?,?,?,?,?)',
-  ).run(snapshotId, albumId, version, payloadJson, hash, null, ts);
-  db.prepare("UPDATE album SET status = 'published', published_at = ?, updated_at = ? WHERE id = ?").run(
-    ts,
-    ts,
-    albumId,
-  );
+  const run = db.transaction(() => {
+    db.prepare(
+      'INSERT INTO album_snapshot (id, album_id, version, payload, payload_hash, share_link_id, created_at) VALUES (?,?,?,?,?,?,?)',
+    ).run(snapshotId, albumId, version, payloadJson, hash, shareLinkId, ts);
+    if (share) {
+      pinShareLinkVersion(share.token, version);
+    }
+    db.prepare("UPDATE album SET status = 'published', published_at = ?, updated_at = ? WHERE id = ?").run(
+      ts,
+      ts,
+      albumId,
+    );
+  });
+  run();
 
   return { version, snapshotId, payloadHash: hash, shareToken: share?.token ?? null };
 }
@@ -551,6 +572,62 @@ export function getSnapshot(albumId: string, version?: number): Record<string, u
     createdAt: row.created_at as string,
     payload: parseJson<Record<string, unknown>>(row.payload, {}),
   };
+}
+
+/** 画册最新已发布版本号；从未发布时返回 null */
+export function latestSnapshotVersion(albumId: string): number | null {
+  const row = getDb()
+    .prepare('SELECT MAX(version) AS v FROM album_snapshot WHERE album_id = ?')
+    .get(albumId) as { v: number | null };
+  return row.v ?? null;
+}
+
+interface SnapshotItemPayload {
+  inspirationId: string;
+  title: string;
+  caption: string | null;
+  sortOrder: number;
+  tags: string[];
+  fuzz: unknown;
+  anchor: string | null;
+  weatherProfile: Record<string, unknown> | null;
+  assets: { id: string; width: number; height: number }[];
+}
+
+export interface FrozenAlbumView {
+  version: number;
+  payloadHash: string;
+  createdAt: string;
+  payload: {
+    albumId: string;
+    title: string;
+    themeNote: string | null;
+    conditionSummary: string;
+    fuzzLevel: FuzzLevel;
+    publishedAt: string;
+    items: SnapshotItemPayload[];
+  };
+}
+
+/** 读取某画册指定版本的冻结内容；版本不存在返回 null（公开页据此判 404） */
+export function getFrozenAlbum(albumId: string, version: number): FrozenAlbumView | null {
+  const snap = getSnapshot(albumId, version);
+  if (!snap) return null;
+  return {
+    version: snap.version as number,
+    payloadHash: snap.payloadHash as string,
+    createdAt: snap.createdAt as string,
+    payload: snap.payload as unknown as FrozenAlbumView['payload'],
+  };
+}
+
+/** 公开分享条目白名单：快照版本内允许访问的 assetId → inspirationId */
+export function snapshotAssetAllowlist(view: FrozenAlbumView): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const item of view.payload.items) {
+    for (const a of item.assets) map.set(a.id, item.inspirationId);
+  }
+  return map;
 }
 
 export function albumItemsDetailed(albumId: string, ctx: SerializeContext): InspirationDto[] {

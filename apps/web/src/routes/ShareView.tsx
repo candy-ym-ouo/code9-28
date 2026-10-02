@@ -9,7 +9,13 @@ interface SharePayload {
   fuzzLevel: string;
   expiresAt: string;
   notice: string;
-  snapshot?: { version: number; payload: { title?: string; conditionSummary?: string } } | null;
+  frozen?: boolean;
+  version?: number;
+  snapshot?: {
+    version: number;
+    createdAt?: string;
+    payload: { title?: string; themeNote?: string; conditionSummary?: string };
+  } | null;
   items?: ShareItem[];
   item?: ShareItem;
 }
@@ -17,6 +23,7 @@ interface SharePayload {
 interface ShareItem {
   id: string;
   title: string;
+  caption?: string | null;
   tags: { id: string; name: string; domain: string }[];
   fuzz: { label: string; geohash: string } | null;
   anchor: string | null;
@@ -117,7 +124,18 @@ export default function ShareView() {
                 <Tag color="green">{data.fuzzLevel}</Tag>
               </Descriptions.Item>
               <Descriptions.Item label="有效期至">{fmtDateTime(data.expiresAt, 'Asia/Shanghai')}</Descriptions.Item>
+              {data.frozen && data.version !== undefined ? (
+                <Descriptions.Item label="内容版本">
+                  <Tag color="blue">v{data.version}（已冻结）</Tag>
+                </Descriptions.Item>
+              ) : null}
             </Descriptions>
+
+            {data.snapshot?.payload?.themeNote ? (
+              <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
+                {data.snapshot.payload.themeNote}
+              </Typography.Paragraph>
+            ) : null}
 
             {data.snapshot?.payload?.conditionSummary ? (
               <Alert
@@ -145,6 +163,11 @@ export default function ShareView() {
                     }
                   >
                     <Typography.Text strong>{i.title}</Typography.Text>
+                    {i.caption ? (
+                      <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginTop: 4, marginBottom: 0 }}>
+                        {i.caption}
+                      </Typography.Paragraph>
+                    ) : null}
                     <div style={{ marginTop: 6 }}>
                       <Space wrap size={[4, 4]}>
                         {i.tags.map((t) => (
@@ -161,9 +184,13 @@ export default function ShareView() {
               ))}
             </Row>
 
-            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              {data.notice}
-            </Typography.Text>
+            {data.frozen ? (
+              <Alert type="success" showIcon message="内容已冻结" description={data.notice} />
+            ) : (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {data.notice}
+              </Typography.Text>
+            )}
           </Space>
         ) : null}
       </Card>

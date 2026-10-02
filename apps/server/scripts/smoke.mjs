@@ -278,9 +278,41 @@ async function main() {
   );
   check('分享内容给出模糊地点标签', typeof view.json?.items?.[0]?.fuzz?.label === 'string');
   check('分享包含"照着做"的条件说明', typeof view.json?.snapshot?.payload?.conditionSummary === 'string');
+  check('画册分享声明内容已冻结到具体版本', view.json?.frozen === true && view.json?.version === publish.json?.version);
+
+  // 13b. 版本冻结：发布后删条目/改名，旧链接内容必须保持 v1 原样
+  const v1Titles = (view.json?.items ?? []).map((i) => i.title).sort();
+  await req('DELETE', `/albums/${albumId}/items/${cardId}`);
+  await req('PATCH', `/inspirations/${cardId}`, { title: '三号楼连廊黄昏逆光（发布后改名）' });
+
+  const frozenView = await req('GET', `/share/${shareToken}?password=2468`, undefined, { noAuth: true });
+  const frozenTitles = (frozenView.json?.items ?? []).map((i) => i.title).sort();
+  check(
+    '发布后删条目+改名不改变旧分享（历史版本冻结）',
+    frozenView.json?.version === 1 && JSON.stringify(frozenTitles) === JSON.stringify(v1Titles),
+    JSON.stringify({ v1Titles, frozenTitles, version: frozenView.json?.version }),
+  );
+
+  // 把卡加回工作副本，再次发布生成 v2；旧链接仍是 v1，新建链接才指向 v2
+  await req('POST', `/albums/${albumId}/items`, { inspirationId: cardId });
+  const republish = await req('POST', `/albums/${albumId}/publish`, { createShare: false });
+  check('改动后再次发布生成新版本（不覆盖旧快照）', republish.status === 201 && republish.json?.version === 2);
+  const v2Link = await req('POST', '/share-links', {
+    scope: 'album',
+    scopeId: albumId,
+    fuzzLevel: 'g500',
+    expiresInDays: 1,
+    password: null,
+  });
+  check('新建画册分享链接绑定当前最新版本', v2Link.json?.snapshotVersion === 2);
+  const v2View = await req('GET', `/share/${v2Link.json?.token}`, undefined, { noAuth: true });
+  check('新链接展示 v2 内容（含发布后的改名）', v2View.json?.version === 2 && v2View.json?.items?.[0]?.title?.includes('发布后改名'));
+  const oldStillV1 = await req('GET', `/share/${shareToken}?password=2468`, undefined, { noAuth: true });
+  check('旧链接仍冻结在 v1 旧标题', oldStillV1.json?.version === 1 && oldStillV1.json?.items?.[0]?.title === '三号楼连廊黄昏逆光');
+  await req('POST', `/share-links/${v2Link.json?.id}/revoke`, {});
 
   const links = await req('GET', '/share-links');
-  const link = (links.json?.items ?? [])[0];
+  const link = (links.json?.items ?? []).find((l) => l.token === shareToken);
   check('分享链接可被列表查看', Boolean(link?.id));
 
   // 14. member 视角：看不到精确坐标

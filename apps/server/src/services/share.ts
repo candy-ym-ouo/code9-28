@@ -16,6 +16,8 @@ export interface ShareLinkRow {
   password_hash: string | null;
   expires_at: string;
   revoked_at: string | null;
+  /** 画册分享绑定的已发布版本号；单卡分享恒为 NULL */
+  snapshot_version: number | null;
   created_by: string;
   view_count: number;
   created_at: string;
@@ -29,6 +31,8 @@ export function createShareLink(params: {
   expiresInDays: number;
   password?: string | null;
   userId: string;
+  /** 画册分享必须传入：该链接冻结在哪个发布版本上 */
+  snapshotVersion?: number | null;
 }): ShareLinkRow {
   if (!config.enableShare) throw errors.badRequest('分享功能已被服务端关闭（ENABLE_SHARE=false）');
 
@@ -41,8 +45,8 @@ export function createShareLink(params: {
   getDb()
     .prepare(
       `INSERT INTO share_link (id, library_id, scope, scope_id, token, fuzz_level, password_hash,
-         expires_at, created_by, view_count, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,0,?)`,
+         expires_at, snapshot_version, created_by, view_count, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,0,?)`,
     )
     .run(
       id,
@@ -53,11 +57,17 @@ export function createShareLink(params: {
       level,
       params.password ? bcrypt.hashSync(params.password, 10) : null,
       new Date(Date.now() + days * 86400000).toISOString(),
+      params.scope === 'album' ? (params.snapshotVersion ?? null) : null,
       params.userId,
       nowIso(),
     );
 
   return getDb().prepare('SELECT * FROM share_link WHERE id = ?').get(id) as ShareLinkRow;
+}
+
+/** 把刚生成的快照版本绑定到发布流程中已创建的分享链接（发布与建链需在同一事务语义下完成） */
+export function pinShareLinkVersion(token: string, version: number): void {
+  getDb().prepare('UPDATE share_link SET snapshot_version = ? WHERE token = ?').run(version, token);
 }
 
 /** 校验分享令牌：撤销、过期、密码三者都必须校验（文档 13.4） */
