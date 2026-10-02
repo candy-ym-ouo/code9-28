@@ -16,7 +16,7 @@ import {
   shareStatus,
   validateShareToken,
 } from '../services/share.js';
-import { albumItemsDetailed, getSnapshot } from '../services/albums.js';
+import { publicItemsFromSnapshot, snapshotContainsAsset, snapshotForShareLink } from '../services/albums.js';
 import { requireInspiration } from '../services/inspirations.js';
 import { toInspirationDto } from '../services/serialization.js';
 import { shareImageFor, type AssetRow } from '../services/assets.js';
@@ -40,6 +40,11 @@ shareRouter.post(
       password: input.password ?? null,
       userId: req.auth!.id,
     });
+    const snapshotVersion = link.snapshot_id
+      ? ((getDb().prepare('SELECT version FROM album_snapshot WHERE id = ?').get(link.snapshot_id) as
+          | { version: number }
+          | undefined)?.version ?? null)
+      : null;
     // 明确告知是否发生了强制降级，避免用户误以为用了精确坐标
     ok(
       res,
@@ -50,6 +55,7 @@ shareRouter.post(
         fuzzLevel: link.fuzz_level,
         downgraded: link.fuzz_level !== input.fuzzLevel,
         expiresAt: link.expires_at,
+        snapshotVersion,
       },
       201,
     );
@@ -72,6 +78,7 @@ shareRouter.get(
         status: shareStatus(l),
         viewCount: l.view_count,
         createdAt: l.created_at,
+        snapshotVersion: l.snapshot_version ?? null,
       })),
     });
   }),
@@ -125,40 +132,67 @@ function passwordFrom(req: { query: unknown; header: (n: string) => string | und
 
 /**
  * 只读分享视图（无需登录）。
- * 输出中**只有模糊坐标**，并且每次请求都会重新校验撤销与过期（不接受缓存兜底）。
+ * 画册内容只来自链接钉住的冻结快照——发布后增删条目不会改变既有分享内容，
+ * 后续改动只有重新发布、生成新版本和新链接才会对外可见。
+ * 输出中**只有模糊坐标**（且不超过链接允许的级别），每次请求都会重新校验撤销与过期。
  */
 publicShareRouter.get(
   '/share/:token',
   ah(async (req, res) => {
     const link = validateShareToken(req.params.token, passwordFrom(req));
+
+    if (link.scope === 'album') {
+      const snapshot = snapshotForShareLink({
+        id: link.id,
+        scopeId: link.scope_id,
+        snapshotId: link.snapshot_id,
+      });
+      if (!snapshot) {
+        logAccess(link.id, false, 'album_snapshot_missing');
+        throw errors.notFound('分享内容（画册尚未发布）');
+      }
+      const linkLevel = link.fuzz_level as FuzzLevel;
+      const items = publicItemsFromSnapshot(snapshot.payload, linkLevel);
+      const payload = snapshot.payload as Record<string, unknown>;
+      logAccess(link.id, true);
+      return ok(res, {
+        scope: 'album',
+        fuzzLevel: link.fuzz_level,
+        expiresAt: link.expires_at,
+        version: snapshot.version,
+        // 快照元信息只投影公开字段：完整 payload（含条目与快照级模糊坐标）不直接外发
+        snapshot: {
+          version: snapshot.version,
+          payloadHash: snapshot.payloadHash,
+          createdAt: snapshot.createdAt,
+          payload: {
+            title: payload.title ?? null,
+            themeNote: payload.themeNote ?? null,
+            conditionSummary: payload.conditionSummary ?? null,
+            publishedAt: payload.publishedAt ?? null,
+            fuzzLevel: payload.fuzzLevel ?? null,
+            itemCount: items.length,
+          },
+        },
+        items: items.map((i) => ({
+          id: i.id,
+          title: i.title,
+          caption: i.caption,
+          tags: i.tags,
+          fuzz: i.fuzz,
+          anchor: i.anchor,
+          assets: i.assets.map((a) => ({ id: a.id, width: a.width, height: a.height, url: `/api/share/${link.token}/assets/${a.id}` })),
+        })),
+        notice: `内容为发布时冻结的第 ${snapshot.version} 版，不随后续编辑变化；链接可能过期或被撤销。地点已按分享级别模糊化。`,
+      });
+    }
+
     const ctx = {
       libraryId: link.library_id,
       role: 'member' as const,
       defaultFuzzLevel: link.fuzz_level as FuzzLevel,
       includePrecise: false,
     };
-
-    if (link.scope === 'album') {
-      const snapshot = getSnapshot(link.scope_id);
-      const items = albumItemsDetailed(link.scope_id, ctx);
-      logAccess(link.id, true);
-      return ok(res, {
-        scope: 'album',
-        fuzzLevel: link.fuzz_level,
-        expiresAt: link.expires_at,
-        snapshot,
-        items: items.map((i) => ({
-          id: i.id,
-          title: i.title,
-          tags: i.tags,
-          fuzz: i.spot?.fuzz ?? null,
-          anchor: i.timing?.timeAnchor ?? null,
-          assets: i.assets.map((a) => ({ id: a.id, width: a.width, height: a.height, url: `/api/share/${link.token}/assets/${a.id}` })),
-        })),
-        notice: '内容随时可能失效；地点已按分享级别模糊化。',
-      });
-    }
-
     const row = requireInspiration(link.scope_id, link.library_id);
     const dto = toInspirationDto(row, ctx);
     logAccess(link.id, true);
@@ -194,11 +228,14 @@ publicShareRouter.get(
     if (link.scope === 'inspiration') {
       allowed = asset.inspiration_id === link.scope_id;
     } else {
-      allowed = Boolean(
-        db
-          .prepare('SELECT 1 AS x FROM album_item WHERE album_id = ? AND inspiration_id = ?')
-          .get(link.scope_id, asset.inspiration_id),
-      );
+      // 画册：只认链接钉住的冻结快照——发布后新加进来的条目图片不可见，
+      // 已冻结条目的图片即使后来被移出画册也仍然可见（既有分享内容不变）
+      const snapshot = snapshotForShareLink({
+        id: link.id,
+        scopeId: link.scope_id,
+        snapshotId: link.snapshot_id,
+      });
+      allowed = snapshot ? snapshotContainsAsset(snapshot.payload, asset.id) : false;
     }
     if (!allowed) {
       logAccess(link.id, false, 'asset_out_of_scope');

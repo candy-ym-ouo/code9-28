@@ -279,9 +279,34 @@ async function main() {
   check('分享内容给出模糊地点标签', typeof view.json?.items?.[0]?.fuzz?.label === 'string');
   check('分享包含"照着做"的条件说明', typeof view.json?.snapshot?.payload?.conditionSummary === 'string');
 
+  // 13b. 发布后增删条目：既有分享内容冻结不变，改动只能生成新版本
+  const frozenIds = (view.json?.items ?? []).map((i) => i.id).sort();
+  const lateCard = await req('POST', '/inspirations', { title: '发布后补的卡（不应出现在旧分享里）' });
+  const addLate = await req('POST', `/albums/${albumId}/items`, { inspirationId: lateCard.json?.id });
+  check('发布后仍可向工作副本补卡', addLate.status === 201, JSON.stringify(addLate.json)?.slice(0, 80));
+  const afterAdd = await req('GET', `/share/${shareToken}?password=2468`, undefined, { noAuth: true });
+  const afterAddIds = (afterAdd.json?.items ?? []).map((i) => i.id).sort();
+  check(
+    '发布后新增条目不改变既有分享内容（冻结）',
+    afterAdd.status === 200 && JSON.stringify(afterAddIds) === JSON.stringify(frozenIds) && !afterAddIds.includes(lateCard.json?.id),
+    `${frozenIds.length} 条 -> ${afterAddIds.length} 条`,
+  );
+  check('分享响应带冻结版本号', (afterAdd.json?.version ?? 0) >= 1, String(afterAdd.json?.version));
+  const republish = await req('POST', `/albums/${albumId}/publish`, { createShare: true, fuzzLevel: 'g500', expiresInDays: 2 });
+  check('重新发布生成新版本', republish.status === 201 && republish.json?.version === 2, JSON.stringify(republish.json)?.slice(0, 120));
+  const v2View = await req('GET', `/share/${republish.json?.shareToken}`, undefined, { noAuth: true });
+  const oldView = await req('GET', `/share/${shareToken}?password=2468`, undefined, { noAuth: true });
+  check(
+    '新链接看新版本、旧链接仍看旧版本',
+    v2View.json?.items?.some((i) => i.id === lateCard.json?.id) === true &&
+      oldView.json?.items?.some((i) => i.id === lateCard.json?.id) === false,
+    `v2 ${v2View.json?.items?.length} 条 / v1 ${oldView.json?.items?.length} 条`,
+  );
+
   const links = await req('GET', '/share-links');
-  const link = (links.json?.items ?? [])[0];
+  const link = (links.json?.items ?? []).find((l) => l.token === shareToken) ?? (links.json?.items ?? [])[0];
   check('分享链接可被列表查看', Boolean(link?.id));
+  check('列表能看到链接钉住的冻结版本', link?.snapshotVersion === 1, String(link?.snapshotVersion));
 
   // 14. member 视角：看不到精确坐标
   const memberEmail = `smoke-member-${Date.now()}@flil.local`;

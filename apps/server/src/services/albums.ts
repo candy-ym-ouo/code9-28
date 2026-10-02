@@ -1,5 +1,16 @@
 import { createHash } from 'node:crypto';
-import type { AlbumGapDto, InspirationDto, TimeAnchor, WeatherPhenomenon } from '@flil/shared';
+import {
+  FUZZ_LEVEL_GEOHASH_LEN,
+  FUZZ_LEVEL_LABEL,
+  geohashCenter,
+  roundCoord,
+  type AlbumGapDto,
+  type FuzzLevel,
+  type FuzzResult,
+  type InspirationDto,
+  type TimeAnchor,
+  type WeatherPhenomenon,
+} from '@flil/shared';
 import { getDb, newId, nowIso, parseJson, toJson } from '../db.js';
 import { errors } from '../http/errors.js';
 import { toAlbumDto, toGapDto, toInspirationDto, type SerializeContext } from './serialization.js';
@@ -418,12 +429,14 @@ export interface PublishResult {
 /**
  * 发布：生成不可变快照（文档 14.5）。
  * 快照内一律是模糊坐标，原图路径永不进入快照。
+ * 若同时创建了分享链接，则把链接与本次快照双向钉住：
+ * 之后增删条目只影响工作副本，既有分享内容保持不变。
  */
 export function publishAlbum(
   albumId: string,
   libraryId: string,
   ctx: SerializeContext,
-  share: { token: string } | null,
+  share: { id: string; token: string } | null,
 ): PublishResult {
   const db = getDb();
   const album = requireAlbum(albumId, libraryId);
@@ -447,7 +460,7 @@ export function publishAlbum(
       .prepare("SELECT * FROM asset WHERE inspiration_id = ? AND role != 'result' ORDER BY created_at LIMIT 3")
       .all(item.inspiration_id) as AssetRow[];
 
-    let fuzz = null;
+    let fuzz: SnapshotFuzz | null = null;
     if (row?.spot_id) {
       const spotRow = db.prepare('SELECT * FROM spot WHERE id = ?').get(row.spot_id as string) as
         | SpotRow
@@ -455,7 +468,13 @@ export function publishAlbum(
       const placeRow = spotRow
         ? ((db.prepare('SELECT * FROM place WHERE id = ?').get(spotRow.place_id) as PlaceRow | undefined) ?? null)
         : null;
-      if (spotRow) fuzz = fuzzSpotCached(spotRow, placeRow, ctx.defaultFuzzLevel);
+      if (spotRow) {
+        fuzz = {
+          ...fuzzSpotCached(spotRow, placeRow, ctx.defaultFuzzLevel),
+          // 额外冻结区域名，供更粗级别分享链接重建标签（不触碰活数据）
+          area: placeRow ? (placeRow.district ?? placeRow.city ?? null) : null,
+        };
+      }
     }
     const timingRow = loadTiming(item.inspiration_id);
 
@@ -497,7 +516,11 @@ export function publishAlbum(
 
   db.prepare(
     'INSERT INTO album_snapshot (id, album_id, version, payload, payload_hash, share_link_id, created_at) VALUES (?,?,?,?,?,?,?)',
-  ).run(snapshotId, albumId, version, payloadJson, hash, null, ts);
+  ).run(snapshotId, albumId, version, payloadJson, hash, share?.id ?? null, ts);
+  if (share) {
+    // 双向钉住的另一半：分享链接永久指向本次生成的快照版本
+    db.prepare('UPDATE share_link SET snapshot_id = ? WHERE id = ?').run(snapshotId, share.id);
+  }
   db.prepare("UPDATE album SET status = 'published', published_at = ?, updated_at = ? WHERE id = ?").run(
     ts,
     ts,
@@ -535,7 +558,23 @@ export function summarizeConditions(
   return parts.length ? `${parts.join('；')}。` : '本册暂未形成统一的条件描述。';
 }
 
-export function getSnapshot(albumId: string, version?: number): Record<string, unknown> | null {
+export interface AlbumSnapshotDto {
+  version: number;
+  payloadHash: string;
+  createdAt: string;
+  payload: Record<string, unknown>;
+}
+
+function rowToSnapshot(row: Record<string, unknown>): AlbumSnapshotDto {
+  return {
+    version: row.version as number,
+    payloadHash: row.payload_hash as string,
+    createdAt: row.created_at as string,
+    payload: parseJson<Record<string, unknown>>(row.payload, {}),
+  };
+}
+
+export function getSnapshot(albumId: string, version?: number): AlbumSnapshotDto | null {
   const db = getDb();
   const row = version
     ? (db.prepare('SELECT * FROM album_snapshot WHERE album_id = ? AND version = ?').get(albumId, version) as
@@ -545,12 +584,118 @@ export function getSnapshot(albumId: string, version?: number): Record<string, u
         | Record<string, unknown>
         | undefined);
   if (!row) return null;
+  return rowToSnapshot(row);
+}
+
+/**
+ * 分享链接钉住的快照：优先链接上的 snapshot_id，其次发布时回填的 share_link_id，
+ * 最后兜底画册最新版（兼容钉住关系建立之前的旧数据）。
+ */
+export function snapshotForShareLink(link: {
+  id: string;
+  scopeId: string;
+  snapshotId: string | null;
+}): AlbumSnapshotDto | null {
+  const db = getDb();
+  const row =
+    (link.snapshotId
+      ? (db.prepare('SELECT * FROM album_snapshot WHERE id = ?').get(link.snapshotId) as
+          | Record<string, unknown>
+          | undefined)
+      : undefined) ??
+    (db
+      .prepare('SELECT * FROM album_snapshot WHERE share_link_id = ? ORDER BY version DESC LIMIT 1')
+      .get(link.id) as Record<string, unknown> | undefined) ??
+    (db
+      .prepare('SELECT * FROM album_snapshot WHERE album_id = ? ORDER BY version DESC LIMIT 1')
+      .get(link.scopeId) as Record<string, unknown> | undefined);
+  return row ? rowToSnapshot(row) : null;
+}
+
+/** 快照 payload 里冻结的单个条目（发布时写入的形状） */
+export interface SnapshotPayloadItem {
+  inspirationId: string;
+  title: string;
+  caption: string | null;
+  sortOrder: number;
+  tags: string[];
+  fuzz: SnapshotFuzz | null;
+  anchor: string | null;
+  weatherProfile: Record<string, unknown> | null;
+  assets: { id: string; width: number; height: number }[];
+}
+
+type SnapshotFuzz = FuzzResult & { area?: string | null };
+
+/** 两者取更粗：快照存的是发布时级别，链接级别是这条链接的精度上限（文档 13.4 安全底线） */
+function coarserFuzzLevel(a: FuzzLevel, b: FuzzLevel): FuzzLevel {
+  return FUZZ_LEVEL_GEOHASH_LEN[a] <= FUZZ_LEVEL_GEOHASH_LEN[b] ? a : b;
+}
+
+/**
+ * 把快照里冻结的模糊结果调整到链接允许的级别。
+ * 需要加粗时从冻结的 geohash 截断推导（geohash 前缀天然嵌套，结果恒定，不触碰活数据）。
+ */
+export function fuzzForLink(fuzz: SnapshotFuzz | null, linkLevel: FuzzLevel): FuzzResult | null {
+  if (!fuzz) return null;
+  const stored = (fuzz.fuzzLevel ?? 'g500') as FuzzLevel;
+  const effective = coarserFuzzLevel(stored, linkLevel);
+  if (effective === stored || !fuzz.geohash) {
+    return { fuzzLevel: stored, lat: fuzz.lat, lng: fuzz.lng, geohash: fuzz.geohash, label: fuzz.label };
+  }
+  const hash = fuzz.geohash.slice(0, FUZZ_LEVEL_GEOHASH_LEN[effective]);
+  const area = fuzz.area ?? null;
+  if (effective === 'neighborhood' || effective === 'district') {
+    return { fuzzLevel: effective, lat: null, lng: null, geohash: hash, label: area ?? FUZZ_LEVEL_LABEL[effective] };
+  }
+  const center = geohashCenter(hash);
   return {
-    version: row.version as number,
-    payloadHash: row.payload_hash as string,
-    createdAt: row.created_at as string,
-    payload: parseJson<Record<string, unknown>>(row.payload, {}),
+    fuzzLevel: effective,
+    lat: roundCoord(center.lat, 5),
+    lng: roundCoord(center.lng, 5),
+    geohash: hash,
+    label: area ? `${FUZZ_LEVEL_LABEL[effective]} · ${area}` : FUZZ_LEVEL_LABEL[effective],
   };
+}
+
+function snapshotTagToDto(raw: string): { id: string; domain: string; name: string } {
+  const idx = raw.indexOf(':');
+  if (idx === -1) return { id: raw, domain: '', name: raw };
+  return { id: raw, domain: raw.slice(0, idx), name: raw.slice(idx + 1) };
+}
+
+/**
+ * 公开分享视图的画册条目：完全来自冻结快照，不读任何活表——
+ * 发布后增删条目、改标题、换标签都不会改变既有分享内容。
+ */
+export function publicItemsFromSnapshot(
+  payload: Record<string, unknown>,
+  linkLevel: FuzzLevel,
+): {
+  id: string;
+  title: string;
+  caption: string | null;
+  tags: { id: string; domain: string; name: string }[];
+  fuzz: FuzzResult | null;
+  anchor: string | null;
+  assets: { id: string; width: number; height: number }[];
+}[] {
+  const items = (payload.items ?? []) as SnapshotPayloadItem[];
+  return items.map((item) => ({
+    id: item.inspirationId,
+    title: item.title,
+    caption: item.caption ?? null,
+    tags: (item.tags ?? []).map(snapshotTagToDto),
+    fuzz: fuzzForLink(item.fuzz ?? null, linkLevel),
+    anchor: item.anchor ?? null,
+    assets: (item.assets ?? []).map((a) => ({ id: a.id, width: a.width, height: a.height })),
+  }));
+}
+
+/** 图片是否属于冻结快照的范围（越权检查只认快照，不认活的 album_item） */
+export function snapshotContainsAsset(payload: Record<string, unknown>, assetId: string): boolean {
+  const items = (payload.items ?? []) as SnapshotPayloadItem[];
+  return items.some((item) => (item.assets ?? []).some((a) => a.id === assetId));
 }
 
 export function albumItemsDetailed(albumId: string, ctx: SerializeContext): InspirationDto[] {

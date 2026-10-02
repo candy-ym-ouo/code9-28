@@ -179,6 +179,8 @@ albumRouter.post(
 
 /**
  * 发布：存在必需缺口则 409；发布生成不可变快照，并可同时创建对外分享链接。
+ * 分享链接与本次快照在同一事务里双向钉住：既有分享内容不随后续增删变化，
+ * 之后的改动只有重新发布生成新版本才会对外可见。
  * 分享级别强制不低于 g500（安全底线）。
  */
 albumRouter.post(
@@ -197,21 +199,26 @@ albumRouter.post(
       })
       .parse(req.body ?? {});
 
-    let share: { token: string } | null = null;
-    if (input.createShare) {
-      const link = createShareLink({
-        libraryId: ctx.libraryId,
-        scope: 'album',
-        scopeId: req.params.id,
-        fuzzLevel: input.fuzzLevel as FuzzLevel,
-        expiresInDays: input.expiresInDays,
-        password: input.password ?? null,
-        userId: req.auth!.id,
-      });
-      share = { token: link.token };
-    }
+    // 链接创建与快照生成同事务：发布被拒（409）时不会留下悬挂的分享链接
+    const run = getDb().transaction(() => {
+      let share: { id: string; token: string } | null = null;
+      if (input.createShare) {
+        const link = createShareLink({
+          libraryId: ctx.libraryId,
+          scope: 'album',
+          scopeId: req.params.id,
+          fuzzLevel: input.fuzzLevel as FuzzLevel,
+          expiresInDays: input.expiresInDays,
+          password: input.password ?? null,
+          userId: req.auth!.id,
+          snapshotPending: true,
+        });
+        share = { id: link.id, token: link.token };
+      }
+      return publishAlbum(req.params.id, ctx.libraryId, ctx, share);
+    });
+    const result = run();
 
-    const result = publishAlbum(req.params.id, ctx.libraryId, ctx, share);
     const album = requireAlbum(req.params.id, ctx.libraryId);
     ok(res, { ...result, item: toAlbumDto(album) }, 201);
   }),
@@ -223,7 +230,7 @@ albumRouter.get(
     const ctx = ctxOf(req);
     requireAlbum(req.params.id, ctx.libraryId);
     const rows = getDb()
-      .prepare('SELECT id, version, payload_hash, created_at FROM album_snapshot WHERE album_id = ? ORDER BY version DESC')
+      .prepare('SELECT id, version, payload_hash, share_link_id, created_at FROM album_snapshot WHERE album_id = ? ORDER BY version DESC')
       .all(req.params.id);
     ok(res, { items: rows, latest: getSnapshot(req.params.id) });
   }),

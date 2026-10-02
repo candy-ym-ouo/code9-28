@@ -177,6 +177,13 @@ export default function Settings() {
                     dataIndex: 'fuzzLevel',
                     render: (v: string) => <Tag color="green">{FUZZ_LABEL[v as keyof typeof FUZZ_LABEL] ?? v}</Tag>,
                   },
+                  {
+                    title: '冻结版本',
+                    dataIndex: 'snapshotVersion',
+                    width: 100,
+                    render: (v, r) =>
+                      r.scope === 'album' ? (v ? <Tag color="blue">v{v}</Tag> : <Tag>未发布</Tag>) : '—',
+                  },
                   { title: '状态', dataIndex: 'status', width: 90 },
                   { title: '访问次数', dataIndex: 'viewCount', width: 90 },
                   {

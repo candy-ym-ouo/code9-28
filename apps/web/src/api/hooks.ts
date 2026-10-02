@@ -315,6 +315,7 @@ export function useShareLinks() {
           expiresAt: string;
           viewCount: number;
           hasPassword: boolean;
+          snapshotVersion: number | null;
         }[];
       }>('/share-links'),
   });

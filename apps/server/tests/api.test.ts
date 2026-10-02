@@ -379,6 +379,155 @@ describe('E7 隐私：模糊化、强制降级与撤销', () => {
   });
 });
 
+describe('E7b 画册发布后：既有分享内容冻结，改动只能生成新版本', () => {
+  let frozenAlbumId = '';
+  let frozenToken = '';
+  let frozenAssetId = '';
+  let lateCardId = '';
+  let lateAssetId = '';
+
+  async function uploadTinyJpeg(inspirationId: string, name: string): Promise<string> {
+    const sharp = (await import('sharp')).default;
+    const jpeg = await sharp({
+      create: { width: 8, height: 8, channels: 3, background: { r: 120, g: 80, b: 40 } },
+    })
+      .jpeg()
+      .toBuffer();
+    const up = await request(app)
+      .post(`/api/inspirations/${inspirationId}/assets`)
+      .set('authorization', `Bearer ${token}`)
+      .attach('files', jpeg, name);
+    expect(up.status).toBe(201);
+    return up.body.items[0].assetId as string;
+  }
+
+  function viewShare(tokenToUse: string) {
+    const saved = token;
+    token = '';
+    const res = call('get', `/api/share/${tokenToUse}`);
+    token = saved;
+    return res;
+  }
+
+  it('未发布的画册不能创建分享链接（没有可冻结的版本）', async () => {
+    const album = await call('post', '/api/albums', {
+      title: '还没发布的册子',
+      rules: { totalMin: 1 },
+    });
+    expect(album.status).toBe(201);
+    const res = await call('post', '/api/share-links', {
+      scope: 'album',
+      scopeId: album.body.id,
+      fuzzLevel: 'g500',
+      expiresInDays: 1,
+    });
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('ALBUM_NOT_PUBLISHED');
+  });
+
+  it('发布 v1：分享内容来自冻结快照', async () => {
+    frozenAssetId = await uploadTinyJpeg(cardId, 'frozen.jpg');
+    const album = await call('post', '/api/albums', {
+      title: '冻结测试册',
+      rules: { totalMin: 1 },
+    });
+    expect(album.status).toBe(201);
+    frozenAlbumId = album.body.id;
+    await call('post', `/api/albums/${frozenAlbumId}/items`, { inspirationId: cardId });
+
+    const publish = await call('post', `/api/albums/${frozenAlbumId}/publish`, {
+      createShare: true,
+      fuzzLevel: 'g500',
+      expiresInDays: 2,
+    });
+    expect(publish.status).toBe(201);
+    expect(publish.body.version).toBe(1);
+    frozenToken = publish.body.shareToken;
+
+    const view = await viewShare(frozenToken);
+    expect(view.status).toBe(200);
+    expect(view.body.version).toBe(1);
+    expect(view.body.items.map((i: { id: string }) => i.id)).toEqual([cardId]);
+    expect(view.body.items[0].assets.map((a: { id: string }) => a.id)).toContain(frozenAssetId);
+  });
+
+  it('发布后增删条目：既有分享内容不变', async () => {
+    // 新卡入册（发布之后）
+    const card2 = await call('post', '/api/inspirations', { title: '发布后补的卡' });
+    lateCardId = card2.body.id;
+    lateAssetId = await uploadTinyJpeg(lateCardId, 'late.jpg');
+    await call('post', `/api/albums/${frozenAlbumId}/items`, { inspirationId: lateCardId });
+
+    let view = await viewShare(frozenToken);
+    expect(view.body.items.map((i: { id: string }) => i.id)).toEqual([cardId]);
+
+    // 再把原卡移出画册
+    const removed = await call('delete', `/api/albums/${frozenAlbumId}/items/${cardId}`);
+    expect(removed.status).toBe(200);
+    view = await viewShare(frozenToken);
+    expect(view.body.items.map((i: { id: string }) => i.id)).toEqual([cardId]);
+  });
+
+  it('图片访问同样冻结：旧条目图片仍可看，后加条目图片不可见', async () => {
+    const saved = token;
+    token = '';
+    const frozenImg = await call('get', `/api/share/${frozenToken}/assets/${frozenAssetId}`);
+    const lateImg = await call('get', `/api/share/${frozenToken}/assets/${lateAssetId}`);
+    token = saved;
+    // 原卡虽已移出画册，但它冻结在 v1 快照里，图片必须仍可访问
+    expect(frozenImg.status).toBe(200);
+    // 后补的卡不在 v1 快照里，它的图片不能通过旧链接泄露
+    expect(lateImg.status).toBe(403);
+    expect(lateImg.body.error.code).toBe('LIBRARY_SCOPE_DENIED');
+  });
+
+  it('链接级别比快照粗时，对外坐标按链接级别再降一档（快照本身不变）', async () => {
+    // 独立创建的分享链接：钉住创建时刻的最新快照（此时为 v1，含带机位的卡）
+    const link = await call('post', '/api/share-links', {
+      scope: 'album',
+      scopeId: frozenAlbumId,
+      fuzzLevel: 'g1k',
+      expiresInDays: 1,
+    });
+    expect(link.status).toBe(201);
+    expect(link.body.snapshotVersion).toBe(1);
+
+    const view = await viewShare(link.body.token);
+    const fuzz = view.body.items[0].fuzz as { geohash: string; fuzzLevel: string };
+    expect(fuzz.fuzzLevel).toBe('g1k');
+    expect(fuzz.geohash).toHaveLength(6);
+
+    // 快照本身仍是发布时的 g500（7 位），对外只是截断加粗，不回写快照
+    const snapshots = await call('get', `/api/albums/${frozenAlbumId}/snapshots`);
+    const stored = snapshots.body.latest.payload.items[0].fuzz as { geohash: string; fuzzLevel: string };
+    expect(stored.fuzzLevel).toBe('g500');
+    expect(stored.geohash).toHaveLength(7);
+    expect(stored.geohash.startsWith(fuzz.geohash)).toBe(true);
+  });
+
+  it('后续改动只能生成新版本：重新发布后新旧链接各看各的版本', async () => {
+    const publish = await call('post', `/api/albums/${frozenAlbumId}/publish`, {
+      createShare: true,
+      fuzzLevel: 'g500',
+      expiresInDays: 2,
+    });
+    expect(publish.status).toBe(201);
+    expect(publish.body.version).toBe(2);
+    const token2 = publish.body.shareToken as string;
+
+    const v2 = await viewShare(token2);
+    const v1 = await viewShare(frozenToken);
+    expect(v2.body.version).toBe(2);
+    expect(v2.body.items.map((i: { id: string }) => i.id)).toEqual([lateCardId]);
+    expect(v1.body.version).toBe(1);
+    expect(v1.body.items.map((i: { id: string }) => i.id)).toEqual([cardId]);
+
+    const snapshots = await call('get', `/api/albums/${frozenAlbumId}/snapshots`);
+    expect(snapshots.body.items).toHaveLength(2);
+    expect(snapshots.body.latest.version).toBe(2);
+  });
+});
+
 describe('E8 检索与零结果兜底', () => {
   it('按标签检索命中', async () => {
     const res = await call('get', `/api/search?tagIds=${tagIds['逆光']}`);

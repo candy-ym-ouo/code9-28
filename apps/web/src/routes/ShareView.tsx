@@ -9,6 +9,7 @@ interface SharePayload {
   fuzzLevel: string;
   expiresAt: string;
   notice: string;
+  version?: number;
   snapshot?: { version: number; payload: { title?: string; conditionSummary?: string } } | null;
   items?: ShareItem[];
   item?: ShareItem;
@@ -117,6 +118,11 @@ export default function ShareView() {
                 <Tag color="green">{data.fuzzLevel}</Tag>
               </Descriptions.Item>
               <Descriptions.Item label="有效期至">{fmtDateTime(data.expiresAt, 'Asia/Shanghai')}</Descriptions.Item>
+              {data.snapshot ? (
+                <Descriptions.Item label="内容版本">
+                  <Tag color="blue">v{data.snapshot.version}（发布时冻结，不随后续编辑变化）</Tag>
+                </Descriptions.Item>
+              ) : null}
             </Descriptions>
 
             {data.snapshot?.payload?.conditionSummary ? (

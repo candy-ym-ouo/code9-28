@@ -19,6 +19,8 @@ export interface ShareLinkRow {
   created_by: string;
   view_count: number;
   created_at: string;
+  /** 画册分享钉住的冻结快照（inspiration 分享为 null） */
+  snapshot_id: string | null;
 }
 
 export function createShareLink(params: {
@@ -29,6 +31,10 @@ export function createShareLink(params: {
   expiresInDays: number;
   password?: string | null;
   userId: string;
+  /** 显式指定要钉住的画册快照 */
+  snapshotId?: string | null;
+  /** 发布流程专用：快照与链接在同一事务里生成，由发布方随后回填 snapshot_id */
+  snapshotPending?: boolean;
 }): ShareLinkRow {
   if (!config.enableShare) throw errors.badRequest('分享功能已被服务端关闭（ENABLE_SHARE=false）');
 
@@ -37,12 +43,26 @@ export function createShareLink(params: {
   const days = Math.min(Math.max(1, params.expiresInDays), config.shareMaxExpireDays);
   const token = crypto.randomBytes(24).toString('base64url');
 
+  // 画册分享必须钉住一个冻结快照，否则"既有分享内容"会随后续增删条目而变化
+  let snapshotId: string | null = null;
+  if (params.scope === 'album') {
+    if (params.snapshotId) {
+      snapshotId = params.snapshotId;
+    } else if (!params.snapshotPending) {
+      const latest = getDb()
+        .prepare('SELECT id FROM album_snapshot WHERE album_id = ? ORDER BY version DESC LIMIT 1')
+        .get(params.scopeId) as { id: string } | undefined;
+      if (!latest) throw errors.albumNotPublished();
+      snapshotId = latest.id;
+    }
+  }
+
   const id = newId();
   getDb()
     .prepare(
       `INSERT INTO share_link (id, library_id, scope, scope_id, token, fuzz_level, password_hash,
-         expires_at, created_by, view_count, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,0,?)`,
+         expires_at, created_by, view_count, created_at, snapshot_id)
+       VALUES (?,?,?,?,?,?,?,?,?,0,?,?)`,
     )
     .run(
       id,
@@ -55,6 +75,7 @@ export function createShareLink(params: {
       new Date(Date.now() + days * 86400000).toISOString(),
       params.userId,
       nowIso(),
+      snapshotId,
     );
 
   return getDb().prepare('SELECT * FROM share_link WHERE id = ?').get(id) as ShareLinkRow;
@@ -106,10 +127,16 @@ export function revokeShareLink(id: string, libraryId: string): void {
   if (res.changes === 0) throw errors.notFound('分享链接（可能已被撤销）');
 }
 
-export function listShareLinks(libraryId: string): ShareLinkRow[] {
+export function listShareLinks(libraryId: string): (ShareLinkRow & { snapshot_version: number | null })[] {
   return getDb()
-    .prepare('SELECT * FROM share_link WHERE library_id = ? ORDER BY created_at DESC')
-    .all(libraryId) as ShareLinkRow[];
+    .prepare(
+      `SELECT l.*, s.version AS snapshot_version
+       FROM share_link l
+       LEFT JOIN album_snapshot s ON s.id = l.snapshot_id
+       WHERE l.library_id = ?
+       ORDER BY l.created_at DESC`,
+    )
+    .all(libraryId) as (ShareLinkRow & { snapshot_version: number | null })[];
 }
 
 export function shareStatus(link: ShareLinkRow): 'active' | 'expired' | 'revoked' {

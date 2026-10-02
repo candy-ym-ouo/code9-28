@@ -289,6 +289,7 @@ export default function AlbumDetail() {
                 <Typography.Text type="secondary">未创建分享链接</Typography.Text>
               )}
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                本次分享链接已钉住 v{published.version}；之后再增删条目不会改变它，只有重新发布才会生成新版本与新链接。
                 在「设置 → 分享审计」里可以随时撤销，撤销后旧链接立即失效。
               </Typography.Text>
             </Space>
